@@ -215,6 +215,11 @@ jobs:
   # Checks: image installs via bootc, boots to multi-user.target, GDM is
   # active, SSH is reachable. No AT-SPI, no behave, no timing sensitivity.
   # See: projectbluefin/dakota#850
+  #
+  # Post-boot assertions (projectbluefin/dakota#651):
+  #   1. UEFI boot entry — ESP has systemd-boot files (fisherman #2)
+  #   2. Flatpak exclusion — org.bootcinstaller not on target (fisherman #1)
+  #   3. LUKS cmdline — rd.luks.name= format parseable (common#385)
   boot-check:
     name: Boot check — gate
     needs: [setup, publish-image]
@@ -259,6 +264,9 @@ jobs:
           # --ipc=host: bootc's loopback install uses IPC for udevd/mount
           # coordination inside the privileged container; without it the
           # loopback attach races and partitions may not be visible.
+          # --bootloader is omitted so the image default (systemd) is used.
+          # This populates the EFI System Partition with bootloader files,
+          # enabling the post-boot UEFI assertion (projectbluefin/dakota#651).
           sudo podman run --rm --privileged --pid=host --ipc=host \
             --security-opt label=type:unconfined_t \
             -v /dev:/dev \
@@ -267,7 +275,6 @@ jobs:
             "${IMAGE}" bootc install to-disk \
               --via-loopback /data/disk.raw \
               --filesystem ext4 \
-              --bootloader none \
               --wipe \
             || { rc=$?; echo "bootc install exited ${rc} — checking whether the deployment was written"; }
           sudo podman rmi "${IMAGE}" 2>/dev/null || true
@@ -288,9 +295,9 @@ jobs:
         run: |
           set -euo pipefail
           # Reuse the loop device attached by the install step.
-          # Disk layout from bootc (--bootloader none, x86-64):
+          # Disk layout from bootc (systemd bootloader, x86-64):
           #   p1 = BIOS boot (1 MiB)
-          #   p2 = EFI System (512 MiB, not populated — bootloader skipped)
+          #   p2 = EFI System (512 MiB, populated with systemd-boot)
           #   p3 = Linux root — ext4, ostree deployments live here
           LOOP="${BOOT_CHECK_LOOP}"
           if [ -z "${LOOP}" ] || ! sudo losetup "${LOOP}" &>/dev/null; then
@@ -311,9 +318,7 @@ jobs:
           VAR="/mnt/ostree/deploy/default/var"
           echo "deploy=${DEPLOY}"
 
-          # --bootloader none skips writing BLS entries to the ESP, so we
-          # find OSTREE_PATH directly from the ostree boot.1 tree on the root
-          # filesystem. bootc writes /ostree/boot.1/default/TREEHASH/N
+          # bootc writes /ostree/boot.1/default/TREEHASH/N
           # regardless of bootloader mode. Fresh install always has exactly
           # one deployment so sort | head -1 is deterministic.
           # Note: boot.1/default/TREEHASH/N is a symlink — omit -type d so
@@ -509,6 +514,64 @@ jobs:
             echo "${FAILED}"
           fi
           echo "Boot check passed."
+
+      # ── Post-boot assertions (projectbluefin/dakota#651) ───────────────
+      # Verify fisherman installer correctness on the booted system.
+      - name: Post-boot assertions
+        run: |
+          set -euo pipefail
+          SSH=(ssh -i /tmp/vm_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+            -o BatchMode=yes -p 2222 bluefin-test@127.0.0.1)
+
+          # ── 1. UEFI boot entry on ESP (fisherman #2) ──────────────────────
+          # After install with --bootloader systemd (image default), the EFI
+          # System Partition must contain the systemd-boot binaries.
+          # This verifies the installer correctly wrote bootloader files to ESP.
+          echo "==> EFI System Partition has systemd-boot"
+          EFI_FILES=$("${SSH[@]}" sudo find /boot/efi/EFI/systemd -type f 2>/dev/null || true)
+          if [[ -z "${EFI_FILES}" ]]; then
+            echo "ERROR: no systemd-boot files found on EFI partition"
+            echo "DEBUG: EFI partition contents:"
+            "${SSH[@]}" sudo find /boot/efi -type f 2>/dev/null || echo "  (empty or missing)"
+            exit 1
+          fi
+          echo "  EFI files found:"
+          echo "${EFI_FILES}" | sed 's/^/    /'
+
+          # ── 2. Installer Flatpaks excluded (fisherman #1) ──────────────────
+          # CopyFlatpaks copies the system flatpak store to the installed system.
+          # The tuna-installer (org.bootcinstaller) must NOT appear on the target.
+          echo "==> No installer Flatpaks on target"
+          INSTALLED=$("${SSH[@]}" flatpak list --system --app 2>/dev/null || true)
+          if echo "${INSTALLED}" | grep -q 'org.bootcinstaller'; then
+            echo "ERROR: installer Flatpak found on target system:"
+            echo "${INSTALLED}" | grep 'org.bootcinstaller'
+            exit 1
+          fi
+          echo "  OK: no org.bootcinstaller in flatpak list"
+
+          # ── 3. LUKS cmdline format (common#385) ────────────────────────────
+          # After a LUKS install, /proc/cmdline must contain a parseable LUKS
+          # UUID using rd.luks.name= or rd.luks.uuid= format. This verifies
+          # the luks-tpm2-autounlock fix will work on the installed system.
+          # If no LUKS is present, this is a no-op (not a failure).
+          echo "==> LUKS cmdline format check"
+          CMDLINE=$("${SSH[@]}" cat /proc/cmdline 2>/dev/null || true)
+          if echo "${CMDLINE}" | grep -q 'rd.luks\.'; then
+            # LUKS is present — verify format is parseable
+            LUKS_ENTRIES=$(echo "${CMDLINE}" | grep -oP 'rd\.luks\.name=[^ ]+|rd\.luks\.uuid=[^ ]+' || true)
+            if [[ -z "${LUKS_ENTRIES}" ]]; then
+              echo "ERROR: LUKS present but no rd.luks.name=/rd.luks.uuid= entries found"
+              echo "DEBUG: cmdline: ${CMDLINE}"
+              exit 1
+            fi
+            echo "  LUKS entries found:"
+            echo "${LUKS_ENTRIES}" | sed 's/^/    /'
+          else
+            echo "  OK: no LUKS in cmdline (non-encrypted install)"
+          fi
+
+          echo "Post-boot assertions passed."
 
       - name: Cleanup VM
         if: always()
